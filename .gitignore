@@ -1,0 +1,4 @@
+.vscode/*
+bin
+bin/*
+src/rqc-128/*.o

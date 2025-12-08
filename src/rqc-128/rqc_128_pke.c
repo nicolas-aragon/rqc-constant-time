@@ -1,0 +1,225 @@
+/** 
+ * \file rqc.c
+ * \brief Implementation of rqc.h
+ */
+
+#include "rqc_128_pke.h"
+#include "rqc_128_parameters.h"
+#include "rbc_43_vspace.h"
+#include "rbc_43_vec.h"
+#include "rbc_43_qre.h"
+#include "rbc_43_augmented_gabidulin.h"
+#include "rqc_128_parsing.h"
+
+/** 
+ * \fn void rqc_128_pke_keygen(uint8_t* pk, uint8_t* sk)
+ * \brief Keygen of the RQC_128_PKE IND-CPA scheme
+ *
+ * The public key is composed of the syndrom <b>s</b> as well as the <b>seed</b> used to generate vectors <b>g</b> and <b>h</b>.
+ *
+ * The secret key is composed of the seed used to generate vectors <b>x</b> and <b>y</b>.
+ * As a technicality, the public key is appended to the secret key in order to respect the NIST API.
+ *
+ * \param[out] pk String containing the public key
+ * \param[out] sk String containing the secret key
+ */
+void rqc_128_pke_keygen(uint8_t* pk, uint8_t* sk) {
+  random_source sk_seedexpander;
+  random_source pk_seedexpander;
+  random_source_init(&sk_seedexpander, RANDOM_SOURCE_SEEDEXP);
+  random_source_init(&pk_seedexpander, RANDOM_SOURCE_SEEDEXP);
+  uint8_t sk_seed[SEEDEXPANDER_SEED_BYTES] = {0};
+  uint8_t pk_seed[SEEDEXPANDER_SEED_BYTES] = {0};
+  rbc_43_qre x, y;
+  rbc_43_qre h, s;
+  rbc_43_vec g;
+
+  rbc_43_qre_init(&x);
+  rbc_43_qre_init(&y);
+  rbc_43_vec_init(&g, RQC_128_PARAM_M);
+  rbc_43_qre_init(&h);
+  rbc_43_qre_init(&s);
+
+  random_source prng;
+  random_source_init(&prng, RANDOM_SOURCE_PRNG);
+
+  // Create seed expanders for public key and secret key
+  random_source_get_bytes(&prng, sk_seed, SEEDEXPANDER_SEED_BYTES);
+  random_source_get_bytes(&prng, pk_seed, SEEDEXPANDER_SEED_BYTES);
+  random_source_seed(&sk_seedexpander, sk_seed);
+  random_source_seed(&pk_seedexpander, pk_seed);
+
+  // Compute secret key
+  rbc_43_qre_set_random_2_syndrome(&sk_seedexpander, x, y, RQC_128_PARAM_N2, RQC_128_PARAM_W_RX, RQC_128_PARAM_W_RY);
+
+  // Compute public key
+  rbc_43_vec_set_random_full_rank(&pk_seedexpander, g, RQC_128_PARAM_M);
+  rbc_43_qre_set_random(&pk_seedexpander, h); 
+  
+  rbc_43_qre_mul(s, h, y);
+  rbc_43_qre_add(s, s, x);
+  // Parse keys to string
+  rqc_public_key_to_string(pk, s, pk_seed);
+  rqc_secret_key_to_string(sk, sk_seed, pk);
+
+  #ifdef VERBOSE
+    printf("\n\nsk_seed: "); for(int i = 0 ; i < SEEDEXPANDER_SEED_BYTES ; ++i) printf("%02x", sk_seed[i]);
+    printf("\n\npk_seed: "); for(int i = 0 ; i < SEEDEXPANDER_SEED_BYTES ; ++i) printf("%02x", pk_seed[i]);
+    printf("\n\nsupport_w: "); rbc_43_vspace_print(support_w, RQC_128_PARAM_W);
+    printf("\n\nx: "); rbc_43_qre_print(x);
+    printf("\n\ny: "); rbc_43_qre_print(y);
+    printf("\n\ng: "); rbc_43_qre_print(g);
+    printf("\n\nh: "); rbc_43_qre_print(h);
+    printf("\n\ns: "); rbc_43_qre_print(s);
+    printf("\n\nsk: "); for(int i = 0 ; i < RQC_128_SECRET_KEY_BYTES ; ++i) printf("%02x", sk[i]);
+    printf("\n\npk: "); for(int i = 0 ; i < RQC_128_PUBLIC_KEY_BYTES ; ++i) printf("%02x", pk[i]);
+  #endif
+
+  rbc_43_qre_clear(x);
+  rbc_43_qre_clear(y);
+  rbc_43_vec_clear(g);
+  rbc_43_qre_clear(h);
+  rbc_43_qre_clear(s);
+  random_source_clear(&sk_seedexpander);
+  random_source_clear(&pk_seedexpander);
+}
+
+
+
+/** 
+ * \fn void rqc_128_pke_encrypt(rbc_43_qre u, rbc_43_qre v, const rbc_43_vec m, uint8_t* theta, const uint8_t* pk)
+ * \brief Encryption of the RQC_128_PKE IND-CPA scheme
+ *
+ * The ciphertext is composed of the vectors <b>u</b> and <b>v</b>.
+ *
+ * \param[out] u Vector* u (first part of the ciphertext)
+ * \param[out] v Vector* v (second part of the ciphertext)
+ * \param[in] m Vector representing the message to encrypt
+ * \param[in] theta Seed used to derive randomness required for encryption
+ * \param[in] pk String containing the public key
+ */
+void rqc_128_pke_encrypt(rbc_43_qre* u, rbc_43_qre* v, const rbc_43_vec m, uint8_t* theta, const uint8_t* pk) {
+  random_source seedexpander;
+  random_source_init(&seedexpander, RANDOM_SOURCE_SEEDEXP);
+  rbc_43_qre h, s;
+  rbc_43_qre r1[RQC_128_PARAM_N1], r2[RQC_128_PARAM_N1], e[RQC_128_PARAM_N1];
+  rbc_43_qre tmp[RQC_128_PARAM_N1];
+  rbc_43_augmented_gabidulin code;
+  rbc_43_vec g;
+
+  rbc_43_vec_init(&g, RQC_128_PARAM_M);
+  rbc_43_qre_init(&h);
+  rbc_43_qre_init(&s);
+  for(int i = 0; i < RQC_128_PARAM_N1; i++){
+    rbc_43_qre_init(&r1[i]);
+    rbc_43_qre_init(&r2[i]);
+    rbc_43_qre_init(&e[i]);
+  }
+
+  // Create seed_expander from theta
+  random_source_seed(&seedexpander, theta);
+
+  // Retrieve g, h and s from public key
+  rqc_public_key_from_string(g, h, s, pk);
+  
+  // Generate r1, r2 and e
+  uint32_t ranks[3] = {RQC_128_PARAM_W_R1, RQC_128_PARAM_W_R2, RQC_128_PARAM_W_E};
+  rbc_43_qre_set_random_block_3_syndrome(&seedexpander, r1, r2, e, RQC_128_PARAM_N1, ranks);
+  
+  // Compute u = r1 + h.r2
+  rbc_43_qre_mul_block(u, h, r2, RQC_128_PARAM_N1);
+  rbc_43_qre_add_block(u, u, r1, RQC_128_PARAM_N1);
+
+  // Compute v = m.G by encoding the message
+  rbc_43_augmented_gabidulin_init(&code, g, RQC_128_PARAM_K, RQC_128_PARAM_N1*RQC_128_PARAM_N2, RQC_128_PARAM_M, RQC_128_PARAM_EPSILON);
+  rbc_43_augmented_gabidulin_encode_block(v, code, m, RQC_128_PARAM_N1, RQC_128_PARAM_N2);
+  // Compute v = m.G + s.r2 + e
+  for(int i = 0; i < RQC_128_PARAM_N1; i++) rbc_43_qre_init(&tmp[i]);
+  rbc_43_qre_mul_block(tmp, s, r2, RQC_128_PARAM_N1);
+  rbc_43_qre_add_block(tmp, tmp, e, RQC_128_PARAM_N1);
+  rbc_43_qre_add_block(v, v, tmp, RQC_128_PARAM_N1);
+
+  #ifdef VERBOSE
+    printf("\n\ng: "); rbc_43_vec_print(g, RQC_128_PARAM_M);
+    printf("\n\nh: "); rbc_43_qre_print(h);
+    printf("\n\ns: "); rbc_43_qre_print(s);
+    printf("\n\nsupport_r: "); rbc_43_vspace_print(support_r, RQC_128_PARAM_W_R);
+    printf("\n\nsupport_e: "); rbc_43_vspace_print(support_e, RQC_128_PARAM_W_E);
+    printf("\n\nr1: "); rbc_43_qre_print(r1);
+    printf("\n\nr2: "); rbc_43_qre_print(r2);
+    printf("\n\ne: "); rbc_43_qre_print(e);
+    printf("\n\nu: "); rbc_43_qre_print(u);
+    printf("\n\nv: "); rbc_43_qre_print(v);
+  #endif
+
+  rbc_43_vec_clear(g);
+  rbc_43_qre_clear(h);
+  rbc_43_qre_clear(s);
+  for(int i = 0; i < RQC_128_PARAM_N1; i++){
+    rbc_43_qre_clear(r1[i]);
+    rbc_43_qre_clear(r2[i]);
+    rbc_43_qre_clear(e[i]);
+    rbc_43_qre_clear(tmp[i]);
+  }
+  random_source_clear(&seedexpander);
+}
+
+
+
+/** 
+ * \fn void rqc_128_pke_decrypt(rbc_43_vec m, const rbc_43_qre u, const rbc_43_qre v, const uint8_t* sk)
+ * \brief Decryption of the RQC_128_PKE IND-CPA scheme
+ *
+ * \param[out] m Vector representing the decrypted message
+ * \param[in] u Vector u (first part of the ciphertext)
+ * \param[in] v Vector v (second part of the ciphertext)
+ * \param[in] sk String containing the secret key
+ */
+void rqc_128_pke_decrypt(rbc_43_vec m, const rbc_43_qre* u, const rbc_43_qre* v, const uint8_t* sk) {
+  uint8_t pk[RQC_128_PUBLIC_KEY_BYTES] = {0};
+  rbc_43_qre x, y, h, s;
+  rbc_43_vec vtmp, g; 
+  rbc_43_qre tmp[RQC_128_PARAM_N1];
+  rbc_43_augmented_gabidulin code;
+
+  rbc_43_qre_init(&x);
+  rbc_43_qre_init(&y);
+  rbc_43_vec_init(&g, RQC_128_PARAM_M);
+  rbc_43_qre_init(&h);
+  rbc_43_qre_init(&s);
+  rbc_43_vec_init(&vtmp, RQC_128_PARAM_N1*RQC_128_PARAM_N2);
+  for(size_t i=0; i < RQC_128_PARAM_N1; i++) rbc_43_qre_init(&tmp[i]);
+
+  // Retrieve x, y, g, h and s from secret key
+  rqc_secret_key_from_string(x, y, pk, sk);
+  rqc_public_key_from_string(g, h, s, pk);
+  
+  // Compute v - u.y
+  rbc_43_qre_mul_block(tmp, y, u, RQC_128_PARAM_N1);
+  rbc_43_qre_add_block(tmp, v, tmp, RQC_128_PARAM_N1);
+
+  for(size_t i = 0; i < RQC_128_PARAM_N1; i++){
+    for(size_t j = 0; j < RQC_128_PARAM_N2; j++){
+      rbc_43_elt_set(vtmp[i*RQC_128_PARAM_N2+j], tmp[i]->v[j]);
+    }
+    rbc_43_qre_clear(tmp[i]);
+  }
+
+  // Compute m by decoding v - u.y
+  rbc_43_augmented_gabidulin_init(&code, g, RQC_128_PARAM_K, RQC_128_PARAM_N1*RQC_128_PARAM_N2, RQC_128_PARAM_M, RQC_128_PARAM_EPSILON);
+  rbc_43_augmented_gabidulin_decode(m, code, vtmp);
+
+  #ifdef VERBOSE
+    printf("\n\nu: "); rbc_43_qre_print(u);
+    printf("\n\nv: "); rbc_43_qre_print(v);
+    printf("\n\ny: "); rbc_43_qre_print(y);
+    printf("\n\nv - u.y: "); rbc_43_qre_print(tmp);
+  #endif
+
+  rbc_43_qre_clear(x);
+  rbc_43_qre_clear(y);
+  rbc_43_vec_clear(g);
+  rbc_43_qre_clear(h);
+  rbc_43_qre_clear(s);
+  rbc_43_vec_clear(vtmp);
+}
